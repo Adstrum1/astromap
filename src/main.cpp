@@ -86,9 +86,11 @@ CoordDigits backupLat, backupLon;
 double fovH = 90.0;              
 double fovV = 90.0 * 0.45;      
 const double FOV_MIN = 20.0;
-const double FOV_MAX = 150.0;
+const double FOV_MAX = 360.0;
 const double FOV_STEP = 10.0;
 const double STEP_DEG = 4.0; 
+
+const double MOON_VISIBILITY_FOV = 60.0;
 
 void applyZoom(double delta) {
   fovH += delta;
@@ -461,6 +463,8 @@ double rad2deg(double r) { return r * 180.0 / M_PI; }
 double norm360(double d) { d = fmod(d, 360.0); if (d < 0) d += 360.0; return d; }
 double norm180(double d) { d = norm360(d); if (d > 180.0) d -= 360.0; return d; }
 
+const double AU_KM = 149597870.7;
+
 void heliocentricPos(int idx, double T, double &x, double &y, double &z) {
   OrbitElem &el = elements[idx];
   double a = el.a + el.adot * T;
@@ -480,6 +484,25 @@ void heliocentricPos(int idx, double T, double &x, double &y, double &z) {
   x = (cosO*cosw - sinO*sinw*cosI)*xOrb + (-cosO*sinw - sinO*cosw*cosI)*yOrb;
   y = (sinO*cosw + cosO*sinw*cosI)*xOrb + (-sinO*sinw + cosO*cosw*cosI)*yOrb;
   z = (sinw*sinI)*xOrb + (cosw*sinI)*yOrb;
+}
+
+void equatorialToAltAz(double raRad, double decRad, double JD, double &alt, double &az) {
+  double T = (JD - 2451545.0) / 36525.0;
+  double d = JD - 2451545.0;
+  double gmst = norm360(280.46061837 + 360.98564736629*d + 0.000387933*T*T - (T*T*T)/38710000.0);
+  double lst = norm360(gmst + OBS_LON);
+  double H = deg2rad(norm180(lst - rad2deg(raRad)));
+  double phi = deg2rad(OBS_LAT);
+
+  double sinAlt = sin(decRad)*sin(phi) + cos(decRad)*cos(phi)*cos(H);
+  double altR = asin(sinAlt);
+  double cosAz = (sin(decRad) - sin(altR)*sin(phi)) / (cos(altR)*cos(phi));
+  if (cosAz > 1) cosAz = 1; if (cosAz < -1) cosAz = -1;
+  double azDeg = rad2deg(acos(cosAz));
+  if (sin(H) > 0) azDeg = 360.0 - azDeg;
+
+  alt = rad2deg(altR);
+  az = norm360(azDeg);
 }
 
 void computeAltAz(int idx, double JD, double &alt, double &az, double &dist) {
@@ -517,8 +540,75 @@ void computeAltAz(int idx, double JD, double &alt, double &az, double &dist) {
 }
 
 // map
+
+struct MoonData {
+  int parentIdx;
+  const char* abbr;
+  const char* fullName;
+  double aKm;
+  double periodDays;
+};
+
+const int MOON_COUNT = 9;
+MoonData moons[MOON_COUNT] = {
+  {3, "Ph", "Phobos",    9376.0,    0.318910},
+  {3, "De", "Deimos",    23463.0,   1.263000},
+  {4, "Io", "Io",        421800.0,  1.769138},
+  {4, "Eu", "Europa",    671100.0,  3.551181},
+  {4, "Ga", "Ganymede",  1070400.0, 7.154553},
+  {4, "Ca", "Callisto",  1882700.0, 16.689020},
+  {5, "Ti", "Titan",     1221870.0, 15.945000},
+  {6, "Tn", "Titania",   436300.0,  8.706000},
+  {7, "Tr", "Triton",    354800.0,  5.877000}
+};
+
+// Arbitrary-phase circular orbit angle
+double moonOrbitAngleDeg(double periodDays, double JD) {
+  const double REF_JD = 2451545.0;
+  double cycles = (JD - REF_JD) / periodDays;
+  double frac = cycles - floor(cycles);
+  return norm360(frac * 360.0);
+}
+
+const double MOON_VISUAL_EXAGGERATION = 45.0;
+
+void computeMoonAltAz(int moonIndex, double JD, double planetAlt, double planetAz, double planetDistAU,
+                       double &alt, double &az, double &angSepDeg) {
+  MoonData &m = moons[moonIndex];
+  double theta = deg2rad(moonOrbitAngleDeg(m.periodDays, JD));
+  double distKm = planetDistAU * AU_KM;
+  double angRadiusDeg = rad2deg(m.aKm / distKm) * MOON_VISUAL_EXAGGERATION;
+  angSepDeg = angRadiusDeg;
+  alt = planetAlt + angRadiusDeg * sin(theta);
+  az  = planetAz  + angRadiusDeg * cos(theta);
+}
+
+// Luna / earth moon
+void computeEarthMoonAltAz(double JD, double &alt, double &az, double &dist) {
+  double T = (JD - 2451545.0) / 36525.0;
+
+  double lonMoon = norm360(218.3164477 + 481267.88123421 * T);
+  double lam = deg2rad(lonMoon);
+  double eps = deg2rad(23.43929111 - 0.0130042 * T);
+
+  double xeq = cos(lam);
+  double yeq = cos(eps) * sin(lam);
+  double zeq = sin(eps) * sin(lam);
+
+  double ra = atan2(yeq, xeq);
+  double dec = asin(zeq);
+
+  equatorialToAltAz(ra, dec, JD, alt, az);
+  dist = 384400.0 / AU_KM; 
+}
+
+// map
+
 double camAz = 180.0, camAlt = 30.0;
-int lockedIdx = -2; 
+
+enum LockType { LOCK_NONE, LOCK_SUN, LOCK_PLANET, LOCK_EARTHMOON, LOCK_SAT_MOON };
+LockType lockedType = LOCK_NONE;
+int lockedIndex = -1;
 
 void plotBody(const char* label, double alt, double az, int top, int h) {
   double dAz = norm180(az - camAz);
@@ -531,28 +621,114 @@ void plotBody(const char* label, double alt, double az, int top, int h) {
   display.print(label);
 }
 
-void tryLockNearest(double JD, int top, int h) {
-  int bestIdx = -3; double bestDist = 1e9;
-  for (int i = -1; i < 8; i++) {
-    if (i == 2) continue; 
+void plotMoon(const char* label, double alt, double az, int top, int h) {
+  double dAz = norm180(az - camAz);
+  double dAlt = alt - camAlt;
+  if (fabs(dAz) > fovH/2.0 || fabs(dAlt) > fovV/2.0) return;
+  int sx = (int)(SCREEN_WIDTH/2.0 + (dAz/(fovH/2.0)) * (SCREEN_WIDTH/2.0));
+  int sy = top + (int)(h/2.0 - (dAlt/(fovV/2.0)) * (h/2.0));
+  display.drawPixel(sx, sy, SSD1306_WHITE);
+  display.drawPixel(sx+1, sy, SSD1306_WHITE);
+  display.drawPixel(sx, sy+1, SSD1306_WHITE);
+  display.setCursor(sx + 3, sy - 4);
+  display.print(label);
+}
+
+void tryLockNearest(double JD) {
+  LockType bestType = LOCK_NONE;
+  int bestIndex = -1;
+  double bestDist2 = 1e9;
+
+  // Sun
+  {
     double alt, az, dist;
-    computeAltAz(i, JD, alt, az, dist);
+    computeAltAz(-1, JD, alt, az, dist);
     double dAz = norm180(az - camAz);
     double dAlt = alt - camAlt;
-    if (fabs(dAz) > fovH/2.0 || fabs(dAlt) > fovV/2.0) continue;
-    double d2 = dAz*dAz + dAlt*dAlt;
-    if (d2 < bestDist) { bestDist = d2; bestIdx = i; }
+    if (fabs(dAz) <= fovH/2.0 && fabs(dAlt) <= fovV/2.0) {
+      double d2 = dAz*dAz + dAlt*dAlt;
+      if (d2 < bestDist2) { bestDist2 = d2; bestType = LOCK_SUN; bestIndex = -1; }
+    }
   }
-  if (bestIdx != -3) lockedIdx = bestIdx;
+
+  // Planets
+  double planetAlt[8], planetAz[8], planetDist[8];
+  for (int i = 0; i < 8; i++) {
+    if (i == 2) continue;
+    computeAltAz(i, JD, planetAlt[i], planetAz[i], planetDist[i]);
+    double dAz = norm180(planetAz[i] - camAz);
+    double dAlt = planetAlt[i] - camAlt;
+    if (fabs(dAz) <= fovH/2.0 && fabs(dAlt) <= fovV/2.0) {
+      double d2 = dAz*dAz + dAlt*dAlt;
+      if (d2 < bestDist2) { bestDist2 = d2; bestType = LOCK_PLANET; bestIndex = i; }
+    }
+  }
+
+  // Earth's Moon
+  {
+    double alt, az, dist;
+    computeEarthMoonAltAz(JD, alt, az, dist);
+    double dAz = norm180(az - camAz);
+    double dAlt = alt - camAlt;
+    if (fabs(dAz) <= fovH/2.0 && fabs(dAlt) <= fovV/2.0) {
+      double d2 = dAz*dAz + dAlt*dAlt;
+      if (d2 < bestDist2) { bestDist2 = d2; bestType = LOCK_EARTHMOON; bestIndex = -1; }
+    }
+  }
+
+  // Satellite moons
+  if (fovH < MOON_VISIBILITY_FOV) {
+    for (int m = 0; m < MOON_COUNT; m++) {
+      int p = moons[m].parentIdx;
+      double alt, az, angSep;
+      computeMoonAltAz(m, JD, planetAlt[p], planetAz[p], planetDist[p], alt, az, angSep);
+      double dAz = norm180(az - camAz);
+      double dAlt = alt - camAlt;
+      if (fabs(dAz) <= fovH/2.0 && fabs(dAlt) <= fovV/2.0) {
+        double d2 = dAz*dAz + dAlt*dAlt;
+        if (d2 < bestDist2) { bestDist2 = d2; bestType = LOCK_SAT_MOON; bestIndex = m; }
+      }
+    }
+  }
+
+  if (bestType != LOCK_NONE) {
+    lockedType = bestType;
+    lockedIndex = bestIndex;
+  }
+}
+
+void getLockedAltAz(double JD, double &alt, double &az, double &dist) {
+  switch (lockedType) {
+    case LOCK_SUN:
+      computeAltAz(-1, JD, alt, az, dist);
+      break;
+    case LOCK_PLANET:
+      computeAltAz(lockedIndex, JD, alt, az, dist);
+      break;
+    case LOCK_EARTHMOON:
+      computeEarthMoonAltAz(JD, alt, az, dist);
+      break;
+    case LOCK_SAT_MOON: {
+      int p = moons[lockedIndex].parentIdx;
+      double pAlt, pAz, pDist, angSep;
+      computeAltAz(p, JD, pAlt, pAz, pDist);
+      computeMoonAltAz(lockedIndex, JD, pAlt, pAz, pDist, alt, az, angSep);
+      dist = pDist; 
+      break;
+    }
+    default:
+      alt = camAlt; az = camAz; dist = 0;
+      break;
+  }
 }
 
 void drawMap() {
   display.clearDisplay();
   double JD = julianDate(clockTime);
 
-  if (lockedIdx != -2) {
+  if (lockedType != LOCK_NONE) {
     double alt, az, dist;
-    computeAltAz(lockedIdx, JD, alt, az, dist);
+    getLockedAltAz(JD, alt, az, dist);
     camAz = az; camAlt = alt;
   }
 
@@ -576,33 +752,64 @@ void drawMap() {
     }
   }
 
+  // Sun
   {
     double alt, az, dist;
     computeAltAz(-1, JD, alt, az, dist);
     plotBody("Su", alt, az, top, h);
   }
+
+  double planetAlt[8], planetAz[8], planetDist[8];
   for (int i = 0; i < 8; i++) {
     if (i == 2) continue;
+    computeAltAz(i, JD, planetAlt[i], planetAz[i], planetDist[i]);
+    plotBody(planetAbbr[i], planetAlt[i], planetAz[i], top, h);
+  }
+
+  if (fovH < MOON_VISIBILITY_FOV) {
+    for (int m = 0; m < MOON_COUNT; m++) {
+      int p = moons[m].parentIdx;
+      double alt, az, angSep;
+      computeMoonAltAz(m, JD, planetAlt[p], planetAz[p], planetDist[p], alt, az, angSep);
+      plotMoon(moons[m].abbr, alt, az, top, h);
+    }
+  }
+
+  {
     double alt, az, dist;
-    computeAltAz(i, JD, alt, az, dist);
-    plotBody(planetAbbr[i], alt, az, top, h);
+    computeEarthMoonAltAz(JD, alt, az, dist);
+    plotBody("Mo", alt, az, top, h);
   }
 
   display.drawLine(cx - 4, cy, cx + 4, cy, SSD1306_WHITE);
   display.drawLine(cx, cy - 4, cx, cy + 4, SSD1306_WHITE);
 
-  if (lockedIdx != -2) {
+  if (lockedType != LOCK_NONE) {
     double alt, az, dist;
-    computeAltAz(lockedIdx, JD, alt, az, dist);
-    const char* name = (lockedIdx == -1) ? "Sun" : planetFull[lockedIdx];
-    const char* kind = (lockedIdx == -1) ? "star" : "planet";
+    getLockedAltAz(JD, alt, az, dist);
+
+    const char* name;
+    const char* kind;
+    switch (lockedType) {
+      case LOCK_SUN:       name = "Sun";                        kind = "star";    break;
+      case LOCK_PLANET:    name = planetFull[lockedIndex];      kind = "planet";  break;
+      case LOCK_EARTHMOON: name = "Moon";                       kind = "moon";    break;
+      case LOCK_SAT_MOON:  name = moons[lockedIndex].fullName;  kind = "moon";    break;
+      default:             name = "";                           kind = "";        break;
+    }
+
     display.setCursor(cx + 6, cy - 10);
     display.print(name);
     display.setCursor(cx + 6, cy + 2);
     display.print(kind);
     display.setCursor(cx + 6, cy + 12);
-    display.print(dist, 2);
-    display.print("a.o.");
+    if (lockedType == LOCK_EARTHMOON) {
+      display.print((long)(dist * AU_KM));
+      display.print("km");
+    } else {
+      display.print(dist, 2);
+      display.print("a.u.");
+    }
   }
 
   display.display();
@@ -611,8 +818,7 @@ void drawMap() {
 void handleMap() {
   double JD = julianDate(clockTime);
 
-  if (lockedIdx == -2) {
-
+  if (lockedType == LOCK_NONE) {
     if (keyPressedEdge(KEY_LEFT))  camAz = norm360(camAz - STEP_DEG);
     if (keyPressedEdge(KEY_RIGHT)) camAz = norm360(camAz + STEP_DEG);
     if (keyPressedEdge(KEY_UP))    { camAlt += STEP_DEG; if (camAlt > 89) camAlt = 89; }
@@ -623,16 +829,17 @@ void handleMap() {
   if (keyPressedEdge(KEY_ZOOM_OUT)) applyZoom(+FOV_STEP);
 
   if (keyPressedEdge(KEY_OK)) {
-    if (lockedIdx == -2) {
-      tryLockNearest(JD, 0, 0); 
+    if (lockedType == LOCK_NONE) {
+      tryLockNearest(JD);
     }
   }
 
   if (keyPressedEdge(KEY_BACK)) {
-    if (lockedIdx != -2) {
-      lockedIdx = -2; 
+    if (lockedType != LOCK_NONE) {
+      lockedType = LOCK_NONE;
+      lockedIndex = -1;
     } else {
-      state = STATE_MENU; 
+      state = STATE_MENU;
       return;
     }
   }
